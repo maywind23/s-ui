@@ -12,7 +12,7 @@ import (
 	"github.com/alireza0/s-ui/util/common"
 )
 
-var InboundTypeWithLink = []string{"socks", "http", "mixed", "shadowsocks", "naive", "hysteria", "hysteria2", "anytls", "tuic", "vless", "trojan", "vmess"}
+var InboundTypeWithLink = []string{"socks", "http", "mixed", "shadowsocks", "naive", "hysteria", "hysteria2", "anytls", "tuic", "vless", "trojan", "vmess", "snell"}
 
 type LinkParam struct {
 	Key   string
@@ -112,9 +112,89 @@ func LinkGenerator(clientConfig json.RawMessage, i *model.Inbound, hostname stri
 		return trojanLink(userConfig["trojan"], *inbound, Addrs)
 	case "vmess":
 		return vmessLink(userConfig["vmess"], *inbound, Addrs)
+	case "snell":
+		if IsSurgeSnellInbound(i.Type, i.Tag) {
+			return surgeSnellLink(*inbound, Addrs)
+		}
 	}
 
 	return []string{}
+}
+
+// surgeSnellLink renders complete entries for Surge's [Proxy] section rather
+// than a URI: Surge does not define a snell:// sharing scheme. The version is
+// read from the inbound (the actual server protocol version), not out_json;
+// sing-box calls the client side of a v5 server "version 4", while Surge calls
+// both sides version 5.
+func surgeSnellLink(inbound map[string]interface{}, addrs []map[string]interface{}) []string {
+	rawPSK := stringOr(inbound["psk"], "")
+	psk, pskOK := surgeConfigValue(rawPSK)
+	versionValue, ok := inbound["version"].(float64)
+	version := int(versionValue)
+	if rawPSK == "" || !pskOK || !ok || version < 1 || version > 6 {
+		return nil
+	}
+
+	params := []string{
+		"psk=" + psk,
+		fmt.Sprintf("version=%d", version),
+	}
+	if version >= 4 {
+		params = append(params, "reuse=true")
+	}
+
+	obfsMode := stringOr(inbound["obfs_mode"], "")
+	if (version <= 3 && (obfsMode == "http" || obfsMode == "tls")) ||
+		((version == 4 || version == 5) && obfsMode == "http") {
+		params = append(params, "obfs="+obfsMode)
+	}
+	if version == 6 {
+		if mode := stringOr(inbound["mode"], ""); mode != "" {
+			params = append(params, "mode="+mode)
+		}
+	}
+
+	var links []string
+	for _, addr := range addrs {
+		host := stringOr(addr["server"], "")
+		port, portOK := addr["server_port"].(float64)
+		// A host cannot legitimately contain profile delimiters. Reject CR/LF
+		// as well so an address override cannot inject another policy line.
+		if host == "" || strings.ContainsAny(host, ",\r\n") || !portOK || port < 1 || port > 65535 {
+			continue
+		}
+		name := surgePolicyName(stringOr(addr["remark"], "SurgeSnell"))
+		links = append(links, fmt.Sprintf(
+			"%s = snell, %s, %.0f, %s",
+			name, host, port, strings.Join(params, ", "),
+		))
+	}
+	return links
+}
+
+// Surge's profile grammar allows comma-containing values when quoted. Control
+// characters are refused because a generated Link must always remain one
+// policy line.
+func surgeConfigValue(value string) (string, bool) {
+	if strings.ContainsAny(value, "\r\n") {
+		return "", false
+	}
+	if strings.ContainsAny(value, ",;#\"'\t ") {
+		escaped := strings.NewReplacer(`\`, `\\`, `"`, `\"`).Replace(value)
+		return `"` + escaped + `"`, true
+	}
+	return value, true
+}
+
+// Surge uses comma and '=' as policy delimiters. They are harmless in a
+// display remark but would split a generated policy name into new fields.
+func surgePolicyName(name string) string {
+	name = strings.NewReplacer("\r", " ", "\n", " ", ",", "-", "=", "-").Replace(name)
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return "SurgeSnell"
+	}
+	return name
 }
 
 func prepareTls(t *model.Tls) map[string]interface{} {

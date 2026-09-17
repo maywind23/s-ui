@@ -56,6 +56,7 @@ Full documentation lives in the [Wiki](https://github.com/alireza0/s-ui/wiki):
 | [API Documentation](https://github.com/alireza0/s-ui/wiki/API-Documentation) | The token-authenticated REST API (`/apiv2`) |
 | [Configuration Objects](https://github.com/alireza0/s-ui/wiki/Configuration-Objects) | Shape of the objects read and written through the API |
 | [Settings Reference](https://github.com/alireza0/s-ui/wiki/Settings-Reference) | Every panel setting and its default |
+| [Dedicated Surge Snell](docs/surge-snell.md) | One Client per Snell inbound, traffic accounting and live Surge Links |
 
 ## Default Installation Information
 - Panel Port: 2095

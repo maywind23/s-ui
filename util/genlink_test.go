@@ -236,3 +236,83 @@ func TestVmessGrpcCarriesTheServiceName(t *testing.T) {
 		t.Errorf("path = %v, want MyService -- the grpc service name was dropped", obj["path"])
 	}
 }
+
+func TestDedicatedSurgeSnellLinkUsesServerVersion(t *testing.T) {
+	inbound := inboundFor(t, "snell", map[string]interface{}{
+		"version":   5,
+		"psk":       "the-pre-shared-key",
+		"obfs_mode": "http",
+	})
+	inbound.Tag = "SurgeSnell-Alice"
+
+	links := LinkGenerator(json.RawMessage(`{}`), inbound, "snell.example.com", "VIP")
+	if len(links) != 1 {
+		t.Fatalf("got %d links, want 1: %v", len(links), links)
+	}
+	want := "VIP-SurgeSnell-Alice = snell, snell.example.com, 443, psk=the-pre-shared-key, version=5, reuse=true, obfs=http"
+	if links[0] != want {
+		t.Fatalf("link = %q, want %q", links[0], want)
+	}
+}
+
+func TestDedicatedSurgeSnellLinkTracksAddressAndV6Mode(t *testing.T) {
+	inbound := inboundFor(t, "snell", map[string]interface{}{
+		"version": 6,
+		"psk":     "new-key",
+		"mode":    "unshaped",
+	})
+	inbound.Tag = "SurgeSnell-Bob"
+	inbound.Addrs = json.RawMessage(`[{"server":"2001:db8::1","server_port":52728,"remark":"-HK"}]`)
+
+	links := LinkGenerator(json.RawMessage(`{}`), inbound, "ignored.example.com", "")
+	want := "SurgeSnell-Bob-HK = snell, 2001:db8::1, 52728, psk=new-key, version=6, reuse=true, mode=unshaped"
+	if len(links) != 1 || links[0] != want {
+		t.Fatalf("links = %v, want [%q]", links, want)
+	}
+}
+
+func TestOrdinarySnellDoesNotGenerateSurgePolicy(t *testing.T) {
+	inbound := inboundFor(t, "snell", map[string]interface{}{
+		"version": 5,
+		"psk":     "shared-key",
+	})
+
+	if links := LinkGenerator(json.RawMessage(`{}`), inbound, "example.com", ""); len(links) != 0 {
+		t.Fatalf("ordinary Snell generated Surge links: %v", links)
+	}
+}
+
+func TestDedicatedSurgeSnellQuotesCommaInPSK(t *testing.T) {
+	inbound := inboundFor(t, "snell", map[string]interface{}{
+		"version": 5,
+		"psk":     "key,with,commas",
+	})
+	inbound.Tag = "SurgeSnell-Quoted"
+
+	links := LinkGenerator(json.RawMessage(`{}`), inbound, "example.com", "")
+	want := `SurgeSnell-Quoted = snell, example.com, 443, psk="key,with,commas", version=5, reuse=true`
+	if len(links) != 1 || links[0] != want {
+		t.Fatalf("links = %v, want [%q]", links, want)
+	}
+}
+
+func TestDedicatedSurgeSnellRejectsMultilineFields(t *testing.T) {
+	for name, tc := range map[string]struct {
+		host string
+		psk  string
+	}{
+		"host": {host: "safe.example\nInjected = direct", psk: "safe"},
+		"psk":  {host: "safe.example", psk: "safe\nInjected = direct"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			inbound := inboundFor(t, "snell", map[string]interface{}{
+				"version": 5,
+				"psk":     tc.psk,
+			})
+			inbound.Tag = "SurgeSnell-Safe"
+			if links := LinkGenerator(json.RawMessage(`{}`), inbound, tc.host, ""); len(links) != 0 {
+				t.Fatalf("unsafe field generated links: %v", links)
+			}
+		})
+	}
+}

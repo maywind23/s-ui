@@ -83,6 +83,9 @@ func (s *ClientService) Save(tx *gorm.DB, act string, data json.RawMessage, host
 		if err = s.validateClientName(tx, &client); err != nil {
 			return nil, err
 		}
+		if err = s.validateDedicatedSurgeSnellAssignments(tx, []*model.Client{&client}); err != nil {
+			return nil, err
+		}
 		if err = setConfigIdentity(&client); err != nil {
 			return nil, err
 		}
@@ -137,6 +140,9 @@ func (s *ClientService) Save(tx *gorm.DB, act string, data json.RawMessage, host
 			}
 			inboundIds = common.UnionUintArray(inboundIds, ids)
 		}
+		if err = s.validateDedicatedSurgeSnellAssignments(tx, clients); err != nil {
+			return nil, err
+		}
 		err = s.updateLinksWithFixedInbounds(tx, clients, hostname)
 		if err != nil {
 			return nil, err
@@ -171,6 +177,9 @@ func (s *ClientService) Save(tx *gorm.DB, act string, data json.RawMessage, host
 			if len(changedInboundIds) > 0 {
 				inboundIds = common.UnionUintArray(inboundIds, changedInboundIds)
 			}
+		}
+		if err = s.validateDedicatedSurgeSnellAssignments(tx, clients); err != nil {
+			return nil, err
 		}
 		if len(inboundIds) > 0 {
 			err = s.updateLinksWithFixedInbounds(tx, clients, hostname)

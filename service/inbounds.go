@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/alireza0/s-ui/database"
 	"github.com/alireza0/s-ui/database/model"
@@ -124,6 +125,17 @@ func (s *InboundService) Save(tx *gorm.DB, act string, data json.RawMessage, ini
 				return err
 			}
 		}
+		dedicated := util.IsSurgeSnellInbound(inbound.Type, inbound.Tag)
+		if dedicated {
+			if act == "new" {
+				err = s.validateNewDedicatedSurgeSnellOwner(tx, initUserIds)
+			} else {
+				err = s.validateExistingDedicatedSurgeSnellOwner(tx, inbound.Id)
+			}
+			if err != nil {
+				return err
+			}
+		}
 
 		if corePtr.IsRunning() {
 			if act == "edit" {
@@ -138,18 +150,22 @@ func (s *InboundService) Save(tx *gorm.DB, act string, data json.RawMessage, ini
 				return err
 			}
 
-			if act == "edit" {
-				inboundConfig, err = s.addUsers(tx, inboundConfig, inbound.Id, inbound.Type)
-			} else {
-				inboundConfig, err = s.initUsers(tx, inboundConfig, initUserIds, inbound.Type)
-			}
-			if err != nil {
-				return err
-			}
+			// A dedicated listener is added only after its ownership relation is
+			// saved below. It is never exposed without an accountable Client.
+			if !dedicated {
+				if act == "edit" {
+					inboundConfig, err = s.addUsers(tx, inboundConfig, inbound.Id, inbound.Type)
+				} else {
+					inboundConfig, err = s.initUsers(tx, inboundConfig, initUserIds, inbound.Type)
+				}
+				if err != nil {
+					return err
+				}
 
-			err = corePtr.AddInbound(inboundConfig)
-			if err != nil {
-				return err
+				err = corePtr.AddInbound(inboundConfig)
+				if err != nil {
+					return err
+				}
 			}
 		}
 
@@ -170,6 +186,11 @@ func (s *InboundService) Save(tx *gorm.DB, act string, data json.RawMessage, ini
 		}
 		if err != nil {
 			return err
+		}
+		if dedicated && corePtr.IsRunning() {
+			if err = s.UpdateInboundsUsers(tx, []uint{inbound.Id}); err != nil {
+				return err
+			}
 		}
 	case "del":
 		var tag string
@@ -234,6 +255,19 @@ func (s *InboundService) GetAllConfig(db *gorm.DB) ([]json.RawMessage, error) {
 		if err != nil {
 			return nil, err
 		}
+		if util.IsSurgeSnellInbound(inbound.Type, inbound.Tag) {
+			client, err := s.dedicatedSurgeSnellBinding(db, inbound.Id)
+			if err != nil {
+				return nil, err
+			}
+			if !client.active(time.Now().Unix()) {
+				continue
+			}
+			// Keep the runtime config PSK-only. The Client relation controls
+			// accounting and listener lifecycle, not Snell authentication.
+			inboundsJson = append(inboundsJson, inboundJson)
+			continue
+		}
 		inboundJson, err = s.addUsers(db, inboundJson, inbound.Id, inbound.Type)
 		if err != nil {
 			return nil, err
@@ -292,6 +326,9 @@ func (s *InboundService) fetchUsers(db *gorm.DB, inboundType string, condition s
 }
 
 func (s *InboundService) addUsers(db *gorm.DB, inboundJson []byte, inboundId uint, inboundType string) ([]byte, error) {
+	if isDedicatedSurgeSnellJSON(inboundType, inboundJson) {
+		return inboundJson, nil
+	}
 	if !s.hasUser(inboundType) {
 		return inboundJson, nil
 	}
@@ -312,6 +349,12 @@ func (s *InboundService) addUsers(db *gorm.DB, inboundJson []byte, inboundId uin
 }
 
 func (s *InboundService) initUsers(db *gorm.DB, inboundJson []byte, clientIds string, inboundType string) ([]byte, error) {
+	if isDedicatedSurgeSnellJSON(inboundType, inboundJson) {
+		if _, err := parseDedicatedSurgeSnellClientIDs(clientIds, true); err != nil {
+			return nil, err
+		}
+		return inboundJson, nil
+	}
 	ClientIds := strings.Split(clientIds, ",")
 	if len(ClientIds) == 0 {
 		return inboundJson, nil
@@ -365,6 +408,34 @@ func (s *InboundService) UpdateInboundsUsers(tx *gorm.DB, ids []uint) error {
 		return err
 	}
 	for _, inbound := range inbounds {
+		if util.IsSurgeSnellInbound(inbound.Type, inbound.Tag) {
+			client, err := s.dedicatedSurgeSnellBinding(tx, inbound.Id)
+			if err != nil {
+				return err
+			}
+
+			err = corePtr.RemoveInbound(inbound.Tag)
+			if err != nil && err != os.ErrInvalid {
+				return err
+			}
+			box.SessionTracker().CloseByInbound(inbound.Tag)
+
+			if !client.active(time.Now().Unix()) {
+				logger.Debug("dedicated Surge Snell inbound ", inbound.Tag, " is stopped: no active client")
+				continue
+			}
+
+			inboundConfig, err := inbound.MarshalJSON()
+			if err != nil {
+				return err
+			}
+			if err = corePtr.AddInbound(inboundConfig); err != nil {
+				return err
+			}
+			logger.Debug("dedicated Surge Snell inbound ", inbound.Tag, " started for client ", client.Name)
+			continue
+		}
+
 		inboundConfig, err := inbound.MarshalJSON()
 		if err != nil {
 			return err

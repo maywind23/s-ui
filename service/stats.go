@@ -8,6 +8,7 @@ import (
 	"github.com/alireza0/s-ui/core"
 	"github.com/alireza0/s-ui/database"
 	"github.com/alireza0/s-ui/database/model"
+	"github.com/alireza0/s-ui/util"
 	"github.com/alireza0/s-ui/util/common"
 
 	"gorm.io/gorm"
@@ -35,6 +36,70 @@ var (
 type StatsService struct {
 }
 
+type dedicatedSurgeSnellStatBinding struct {
+	ID   uint   `gorm:"column:id"`
+	Tag  string `gorm:"column:tag"`
+	Name string `gorm:"column:name"`
+}
+
+// dedicatedSurgeSnellStatBindings maps each dedicated listener to its sole
+// Client. The existing JSON relation keeps this change schema-free and makes a
+// rollback possible with the stock binary and unchanged database.
+func dedicatedSurgeSnellStatBindings(db *gorm.DB) (map[string]string, error) {
+	var rows []dedicatedSurgeSnellStatBinding
+	err := db.Raw(
+		`SELECT DISTINCT clients.id AS id, inbounds.tag AS tag, clients.name AS name
+		 FROM clients, json_each(clients.inbounds) AS je, inbounds
+		 WHERE inbounds.id = CAST(je.value AS INTEGER)
+		   AND inbounds.type = 'snell'
+		   AND substr(inbounds.tag, 1, ?) = ?`,
+		len(util.SurgeSnellTagPrefix), util.SurgeSnellTagPrefix,
+	).Scan(&rows).Error
+	if err != nil {
+		return nil, err
+	}
+
+	seen := make(map[string]dedicatedSurgeSnellStatBinding, len(rows))
+	bindings := make(map[string]string, len(rows))
+	for _, row := range rows {
+		if old, exists := seen[row.Tag]; exists && old.ID != row.ID {
+			return nil, common.NewErrorf(
+				"dedicated Surge Snell inbound %q is assigned to multiple clients (%q, %q)",
+				row.Tag, old.Name, row.Name,
+			)
+		}
+		seen[row.Tag] = row
+		bindings[row.Tag] = row.Name
+	}
+	return bindings, nil
+}
+
+// appendDedicatedSurgeSnellUserStats clones every dedicated inbound counter
+// as a standard user counter. Quota, expiry, online status, charting and reset
+// can then use the existing Client paths unchanged.
+func appendDedicatedSurgeSnellUserStats(db *gorm.DB, raw []model.Stats) ([]model.Stats, error) {
+	bindings, err := dedicatedSurgeSnellStatBindings(db)
+	if err != nil {
+		return nil, err
+	}
+	result := append([]model.Stats(nil), raw...)
+	for _, stat := range raw {
+		if stat.Resource != "inbound" {
+			continue
+		}
+		clientName, ok := bindings[stat.Tag]
+		if !ok {
+			continue
+		}
+		userStat := stat
+		userStat.Id = 0
+		userStat.Resource = "user"
+		userStat.Tag = clientName
+		result = append(result, userStat)
+	}
+	return result, nil
+}
+
 func (s *StatsService) SaveStats(enableTraffic bool, bucketSeconds int64) error {
 	if corePtr == nil || !corePtr.IsRunning() {
 		return nil
@@ -51,12 +116,13 @@ func (s *StatsService) SaveStats(enableTraffic bool, bucketSeconds int64) error 
 
 	statsMu.Lock()
 	// Anything a previous cycle could not commit goes in ahead of this one.
-	batch := append(pendingStats, (*drained)...)
+	rawBatch := append([]model.Stats(nil), pendingStats...)
+	rawBatch = append(rawBatch, (*drained)...)
 	pendingStats = nil
 	online := &onlines{}
 	statsMu.Unlock()
 
-	if len(batch) == 0 {
+	if len(rawBatch) == 0 {
 		statsMu.Lock()
 		onlineResources = online
 		statsMu.Unlock()
@@ -78,7 +144,9 @@ func (s *StatsService) SaveStats(enableTraffic bool, bucketSeconds int64) error 
 		if err != nil {
 			// Hold the drained traffic for the next cycle rather than dropping
 			// it on the floor.
-			pendingStats = batch
+			// Synthetic user rows are rebuilt from raw counters, otherwise a
+			// retry after SQLITE_BUSY charges the Client twice.
+			pendingStats = rawBatch
 		} else {
 			onlineResources = online
 		}
@@ -86,6 +154,10 @@ func (s *StatsService) SaveStats(enableTraffic bool, bucketSeconds int64) error 
 	}()
 
 	now := time.Now().Unix()
+	batch, err := appendDedicatedSurgeSnellUserStats(tx, rawBatch)
+	if err != nil {
+		return err
+	}
 
 	// Aggregate per-resource so each active inbound/outbound/user is reported
 	// online once (a tag may now appear in both directions), and each user's
