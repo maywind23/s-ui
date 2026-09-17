@@ -69,7 +69,7 @@ Full documentation lives in the [Wiki](https://github.com/alireza0/s-ui/wiki):
 
 ### Linux/macOS
 ```sh
-bash <(curl -Ls https://raw.githubusercontent.com/alireza0/s-ui/master/install.sh)
+bash <(curl -Ls https://raw.githubusercontent.com/maywind23/s-ui/master/install.sh)
 ```
 
 #### Installer language
