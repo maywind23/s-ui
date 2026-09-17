@@ -339,5 +339,8 @@ jobs:
           tag: ${{ github.event_name == 'release' && github.event.release.tag_name || github.ref_name }}
           file: dist/*
           file_glob: true
-          prerelease: true
+          # The installer resolves /releases/latest, which deliberately ignores
+          # prereleases. Publish tagged fork builds as stable releases so the
+          # no-argument install command can discover them.
+          prerelease: false
           overwrite: true
