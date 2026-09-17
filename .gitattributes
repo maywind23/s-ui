@@ -1,0 +1,3 @@
+# Standalone patches contain diff markers whose payload whitespace must remain
+# byte-for-byte stable for checksum verification and git apply.
+contrib/surge-snell/surge-snell.patch -diff -text

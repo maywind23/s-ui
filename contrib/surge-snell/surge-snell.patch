@@ -1,0 +1,1264 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: William <maywind23@gmail.com>
+Date: Thu, 17 Sep 2026 17:50:41 +0800
+Subject: [PATCH] feat: add dedicated Surge Snell accounts
+
+---
+ README.md                             |   1 +
+ docs/surge-snell.md                   |  65 +++++
+ service/client.go                     |   9 +
+ service/dedicated_surge_snell_test.go | 365 ++++++++++++++++++++++++++
+ service/inbounds.go                   |  93 ++++++-
+ service/stats.go                      |  78 +++++-
+ service/surge_snell.go                | 262 ++++++++++++++++++
+ util/genLink.go                       |  82 +++++-
+ util/genlink_test.go                  |  80 ++++++
+ util/surgeSnell.go                    |  12 +
+ 10 files changed, 1032 insertions(+), 15 deletions(-)
+ create mode 100644 docs/surge-snell.md
+ create mode 100644 service/dedicated_surge_snell_test.go
+ create mode 100644 service/surge_snell.go
+ create mode 100644 util/surgeSnell.go
+
+diff --git a/README.md b/README.md
+index 0380d4d..a74b79b 100644
+--- a/README.md
++++ b/README.md
+@@ -56,6 +56,7 @@ Full documentation lives in the [Wiki](https://github.com/alireza0/s-ui/wiki):
+ | [API Documentation](https://github.com/alireza0/s-ui/wiki/API-Documentation) | The token-authenticated REST API (`/apiv2`) |
+ | [Configuration Objects](https://github.com/alireza0/s-ui/wiki/Configuration-Objects) | Shape of the objects read and written through the API |
+ | [Settings Reference](https://github.com/alireza0/s-ui/wiki/Settings-Reference) | Every panel setting and its default |
++| [Dedicated Surge Snell](docs/surge-snell.md) | One Client per Snell inbound, traffic accounting and live Surge Links |
+ 
+ ## Default Installation Information
+ - Panel Port: 2095
+diff --git a/docs/surge-snell.md b/docs/surge-snell.md
+new file mode 100644
+index 0000000..10b2138
+--- /dev/null
++++ b/docs/surge-snell.md
+@@ -0,0 +1,65 @@
++# Dedicated Surge Snell
++
++This fork supports a dedicated Snell mode for Surge users. It preserves the
++normal multi-user Snell behaviour and activates dedicated mode only when both
++conditions are true:
++
++- the inbound type is `snell`;
++- the inbound tag starts with `SurgeSnell-` (case-sensitive).
++
++## Create a node
++
++1. Create the Client account first and set its Volume, Expiry, Enable and Auto
++   Reset fields as needed.
++2. Create a Snell inbound whose tag is `SurgeSnell-<account>`.
++3. Select exactly one Client in the inbound's initial users field. A Client can
++   own at most one dedicated Surge Snell inbound, and an inbound cannot be
++   shared by multiple Clients.
++4. Set the Snell port, version and `psk`. The inbound's **pre-shared key is the
++   PSK used by Surge**.
++
++The Client's QR dialog, under **Links**, then contains a complete entry for the
++Surge `[Proxy]` section, for example:
++
++```ini
++SurgeSnell-Alice = snell, 203.0.113.10, 30660, psk=example-key, version=5, reuse=true
++```
++
++The generated entry tracks edits to the inbound tag, public address, port,
++PSK, version, v5 HTTP obfuscation and v6 mode. S-UI's raw subscription output
++uses the same line (and may base64-encode the complete response when the global
++subscription encoding option is enabled).
++
++## Accounting and lifecycle
++
++Surge authenticates Snell with a shared PSK and does not send sing-box's
++per-user `userkey`. Dedicated mode therefore keeps the live Snell config
++PSK-only and attributes the inbound counters to its sole Client. Existing
++Client behaviour then applies without a database migration:
++
++- upload/download usage and traffic charts;
++- Volume quota and Expiry enforcement;
++- manual Enable/Disable;
++- periodic Auto Reset and global traffic reset.
++
++When the Client is disabled, expired, over quota or temporarily unassigned,
++the dedicated listener is removed from the running core. It is restored when
++the Client becomes active again. Ambiguous legacy data with multiple owners
++fails closed.
++
++Do not share a dedicated inbound's PSK: every device using that PSK contributes
++to the same Client's traffic counters.
++
++## Rollback
++
++The feature adds no database columns or migrations. Reverting its Git commit
++restores stock behaviour without converting the database:
++
++```sh
++git revert <surge-snell-feature-commit>
++```
++
++If using the standalone patch bundle published with this fork, run its
++`rollback.sh` from a clean checkout. Dedicated inbounds remain valid ordinary
++Snell records after rollback, but Surge-specific per-Client accounting and
++generated Links are no longer available.
+diff --git a/service/client.go b/service/client.go
+index 6657463..57594a4 100644
+--- a/service/client.go
++++ b/service/client.go
+@@ -83,6 +83,9 @@ func (s *ClientService) Save(tx *gorm.DB, act string, data json.RawMessage, host
+ 		if err = s.validateClientName(tx, &client); err != nil {
+ 			return nil, err
+ 		}
++		if err = s.validateDedicatedSurgeSnellAssignments(tx, []*model.Client{&client}); err != nil {
++			return nil, err
++		}
+ 		if err = setConfigIdentity(&client); err != nil {
+ 			return nil, err
+ 		}
+@@ -137,6 +140,9 @@ func (s *ClientService) Save(tx *gorm.DB, act string, data json.RawMessage, host
+ 			}
+ 			inboundIds = common.UnionUintArray(inboundIds, ids)
+ 		}
++		if err = s.validateDedicatedSurgeSnellAssignments(tx, clients); err != nil {
++			return nil, err
++		}
+ 		err = s.updateLinksWithFixedInbounds(tx, clients, hostname)
+ 		if err != nil {
+ 			return nil, err
+@@ -172,6 +178,9 @@ func (s *ClientService) Save(tx *gorm.DB, act string, data json.RawMessage, host
+ 				inboundIds = common.UnionUintArray(inboundIds, changedInboundIds)
+ 			}
+ 		}
++		if err = s.validateDedicatedSurgeSnellAssignments(tx, clients); err != nil {
++			return nil, err
++		}
+ 		if len(inboundIds) > 0 {
+ 			err = s.updateLinksWithFixedInbounds(tx, clients, hostname)
+ 			if err != nil {
+diff --git a/service/dedicated_surge_snell_test.go b/service/dedicated_surge_snell_test.go
+new file mode 100644
+index 0000000..2900907
+--- /dev/null
++++ b/service/dedicated_surge_snell_test.go
+@@ -0,0 +1,365 @@
++package service
++
++import (
++	"encoding/json"
++	"fmt"
++	"strconv"
++	"testing"
++	"time"
++
++	"github.com/alireza0/s-ui/database/model"
++	"github.com/alireza0/s-ui/util"
++
++	"gorm.io/gorm"
++)
++
++func createDedicatedSnellInbound(t *testing.T, db *gorm.DB, tag string) *model.Inbound {
++	t.Helper()
++	inbound := &model.Inbound{
++		Type:    "snell",
++		Tag:     tag,
++		Options: json.RawMessage(`{"listen":"::","listen_port":30660,"version":5,"psk":"test-psk","obfs_mode":"none"}`),
++		Addrs:   json.RawMessage(`[]`),
++		OutJson: json.RawMessage(`null`),
++	}
++	if err := db.Create(inbound).Error; err != nil {
++		t.Fatalf("creating inbound: %v", err)
++	}
++	return inbound
++}
++
++func bindClientToInbound(t *testing.T, db *gorm.DB, client *model.Client, inboundIDs ...uint) {
++	t.Helper()
++	raw, err := json.Marshal(inboundIDs)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if err = db.Model(client).Update("inbounds", raw).Error; err != nil {
++		t.Fatal(err)
++	}
++	client.Inbounds = raw
++}
++
++func TestDedicatedSurgeSnellMarker(t *testing.T) {
++	for _, tc := range []struct {
++		protocol string
++		tag      string
++		want     bool
++	}{
++		{"snell", "SurgeSnell-Alice", true},
++		{"snell", "surgesnell-Alice", false},
++		{"snell", "Snell-Alice", false},
++		{"vless", "SurgeSnell-Alice", false},
++	} {
++		if got := util.IsSurgeSnellInbound(tc.protocol, tc.tag); got != tc.want {
++			t.Errorf("IsSurgeSnellInbound(%q, %q) = %v, want %v", tc.protocol, tc.tag, got, tc.want)
++		}
++	}
++}
++
++func TestParseDedicatedSurgeSnellClientIDs(t *testing.T) {
++	for _, value := range []string{"2", " 2 ", "2,2", ",2,"} {
++		ids, err := parseDedicatedSurgeSnellClientIDs(value, true)
++		if err != nil || len(ids) != 1 || ids[0] != 2 {
++			t.Errorf("%q should resolve to client 2, got %v, %v", value, ids, err)
++		}
++	}
++	for _, value := range []string{"", "2,3", "0", "not-an-id"} {
++		if _, err := parseDedicatedSurgeSnellClientIDs(value, true); err == nil {
++			t.Errorf("%q should be rejected", value)
++		}
++	}
++}
++
++func TestDedicatedSurgeSnellClientActive(t *testing.T) {
++	const now = int64(1_000)
++	for name, tc := range map[string]struct {
++		client *dedicatedSurgeSnellClient
++		want   bool
++	}{
++		"nil":             {nil, false},
++		"disabled":        {&dedicatedSurgeSnellClient{}, false},
++		"unlimited":       {&dedicatedSurgeSnellClient{Enable: true}, true},
++		"at quota":        {&dedicatedSurgeSnellClient{Enable: true, Volume: 100, Up: 40, Down: 60}, true},
++		"over quota":      {&dedicatedSurgeSnellClient{Enable: true, Volume: 100, Up: 41, Down: 60}, false},
++		"expires now":     {&dedicatedSurgeSnellClient{Enable: true, Expiry: now}, true},
++		"already expired": {&dedicatedSurgeSnellClient{Enable: true, Expiry: now - 1}, false},
++	} {
++		t.Run(name, func(t *testing.T) {
++			if got := tc.client.active(now); got != tc.want {
++				t.Errorf("active = %v, want %v", got, tc.want)
++			}
++		})
++	}
++}
++
++func TestDedicatedSurgeSnellConfigIsPSKOnlyAndFailClosed(t *testing.T) {
++	db := clientTestDB(t)
++	inbound := createDedicatedSnellInbound(t, db, "SurgeSnell-Alice")
++	client := createClient(t, db, &model.Client{Name: "Alice", Enable: true})
++	bindClientToInbound(t, db, client, inbound.Id)
++
++	configs, err := (&InboundService{}).GetAllConfig(db)
++	if err != nil {
++		t.Fatalf("GetAllConfig: %v", err)
++	}
++	if len(configs) != 1 {
++		t.Fatalf("expected one active config, got %d", len(configs))
++	}
++	var config map[string]interface{}
++	if err = json.Unmarshal(configs[0], &config); err != nil {
++		t.Fatal(err)
++	}
++	if _, exists := config["users"]; exists {
++		t.Fatalf("dedicated Snell must stay PSK-only, got %s", configs[0])
++	}
++	if config["psk"] != "test-psk" {
++		t.Errorf("PSK was not preserved: %v", config["psk"])
++	}
++
++	if err = db.Model(client).Update("enable", false).Error; err != nil {
++		t.Fatal(err)
++	}
++	configs, err = (&InboundService{}).GetAllConfig(db)
++	if err != nil {
++		t.Fatalf("GetAllConfig for disabled client: %v", err)
++	}
++	if len(configs) != 0 {
++		t.Fatalf("disabled client's listener must be absent, got %d configs", len(configs))
++	}
++
++	if err = db.Model(client).Updates(map[string]interface{}{
++		"enable": true,
++		"expiry": time.Now().Unix() - 1,
++	}).Error; err != nil {
++		t.Fatal(err)
++	}
++	configs, err = (&InboundService{}).GetAllConfig(db)
++	if err != nil {
++		t.Fatalf("GetAllConfig for expired client: %v", err)
++	}
++	if len(configs) != 0 {
++		t.Fatalf("expired client's listener must be absent, got %d configs", len(configs))
++	}
++
++	if err = db.Model(client).Updates(map[string]interface{}{
++		"expiry": 0,
++		"volume": 100,
++		"up":     60,
++		"down":   41,
++	}).Error; err != nil {
++		t.Fatal(err)
++	}
++	configs, err = (&InboundService{}).GetAllConfig(db)
++	if err != nil {
++		t.Fatalf("GetAllConfig for over-quota client: %v", err)
++	}
++	if len(configs) != 0 {
++		t.Fatalf("over-quota client's listener must be absent, got %d configs", len(configs))
++	}
++}
++
++func TestDedicatedSurgeSnellUnassignedAndMultipleOwnersFailClosed(t *testing.T) {
++	db := clientTestDB(t)
++	inbound := createDedicatedSnellInbound(t, db, "SurgeSnell-Shared")
++
++	configs, err := (&InboundService{}).GetAllConfig(db)
++	if err != nil || len(configs) != 0 {
++		t.Fatalf("unassigned listener should be omitted, configs=%d err=%v", len(configs), err)
++	}
++
++	bound, _ := json.Marshal([]uint{inbound.Id})
++	createClient(t, db, &model.Client{Name: "Alice", Enable: true, Inbounds: bound})
++	createClient(t, db, &model.Client{Name: "Bob", Enable: true, Inbounds: bound})
++	if _, err = (&InboundService{}).GetAllConfig(db); err == nil {
++		t.Fatal("multiple owners should fail closed")
++	}
++}
++
++func TestDedicatedSurgeSnellAssignmentValidation(t *testing.T) {
++	db := clientTestDB(t)
++	first := createDedicatedSnellInbound(t, db, "SurgeSnell-First")
++	second := createDedicatedSnellInbound(t, db, "SurgeSnell-Second")
++	service := &ClientService{}
++
++	twoIDs, _ := json.Marshal([]uint{first.Id, second.Id})
++	if err := service.validateDedicatedSurgeSnellAssignments(db, []*model.Client{{
++		Name: "Alice", Inbounds: twoIDs,
++	}}); err == nil {
++		t.Fatal("one client owning two dedicated inbounds should be rejected")
++	}
++
++	firstOnly, _ := json.Marshal([]uint{first.Id})
++	if err := service.validateDedicatedSurgeSnellAssignments(db, []*model.Client{
++		{Name: "Alice", Inbounds: firstOnly},
++		{Name: "Bob", Inbounds: firstOnly},
++	}); err == nil {
++		t.Fatal("two proposed clients sharing one dedicated inbound should be rejected")
++	}
++
++	owner := createClient(t, db, &model.Client{Name: "Owner", Enable: true, Inbounds: firstOnly})
++	if err := service.validateDedicatedSurgeSnellAssignments(db, []*model.Client{{
++		Name: "Intruder", Inbounds: firstOnly,
++	}}); err == nil {
++		t.Fatal("claiming another client's inbound should be rejected")
++	}
++	if err := service.validateDedicatedSurgeSnellAssignments(db, []*model.Client{{
++		Id: owner.Id, Name: owner.Name, Inbounds: firstOnly,
++	}}); err != nil {
++		t.Fatalf("the persisted owner should be accepted: %v", err)
++	}
++}
++
++func TestDedicatedSurgeSnellInboundCreationRequiresFreeOwner(t *testing.T) {
++	db := clientTestDB(t)
++	service := &InboundService{}
++	free := createClient(t, db, &model.Client{Name: "Free", Enable: true})
++
++	if err := service.validateNewDedicatedSurgeSnellOwner(db, ""); err == nil {
++		t.Fatal("an owner is required")
++	}
++	if err := service.validateNewDedicatedSurgeSnellOwner(db, "999999"); err == nil {
++		t.Fatal("the owner must exist")
++	}
++	if err := service.validateNewDedicatedSurgeSnellOwner(db, strconv.FormatUint(uint64(free.Id), 10)); err != nil {
++		t.Fatalf("free owner rejected: %v", err)
++	}
++
++	existing := createDedicatedSnellInbound(t, db, "SurgeSnell-Existing")
++	bindClientToInbound(t, db, free, existing.Id)
++	if err := service.validateNewDedicatedSurgeSnellOwner(db, strconv.FormatUint(uint64(free.Id), 10)); err == nil {
++		t.Fatal("a client already owning a dedicated inbound should be rejected")
++	}
++}
++
++func TestDedicatedSurgeSnellLinksRefreshAfterInboundChange(t *testing.T) {
++	db := clientTestDB(t)
++	inbound := createDedicatedSnellInbound(t, db, "SurgeSnell-Alice")
++	client := createClient(t, db, &model.Client{Name: "Alice", Enable: true, Remark: "VIP"})
++	service := &ClientService{}
++
++	if err := service.UpdateClientsOnInboundAdd(
++		db, strconv.FormatUint(uint64(client.Id), 10), inbound.Id, "198.51.100.10",
++	); err != nil {
++		t.Fatalf("UpdateClientsOnInboundAdd: %v", err)
++	}
++	got := reload(t, db, client.Id)
++	assertOnlyLocalLink(t, got.Links,
++		"VIP-SurgeSnell-Alice = snell, 198.51.100.10, 30660, psk=test-psk, version=5, reuse=true")
++
++	oldTag := inbound.Tag
++	inbound.Tag = "SurgeSnell-Alice-New"
++	inbound.Options = json.RawMessage(`{"listen":"::","listen_port":52728,"version":6,"psk":"rotated-psk","mode":"unshaped"}`)
++	if err := db.Save(inbound).Error; err != nil {
++		t.Fatal(err)
++	}
++	if err := service.UpdateLinksByInboundChange(db, &[]model.Inbound{*inbound}, "203.0.113.7", oldTag); err != nil {
++		t.Fatalf("UpdateLinksByInboundChange: %v", err)
++	}
++	got = reload(t, db, client.Id)
++	assertOnlyLocalLink(t, got.Links,
++		"VIP-SurgeSnell-Alice-New = snell, 203.0.113.7, 52728, psk=rotated-psk, version=6, reuse=true, mode=unshaped")
++}
++
++func assertOnlyLocalLink(t *testing.T, raw json.RawMessage, want string) {
++	t.Helper()
++	var links []map[string]string
++	if err := json.Unmarshal(raw, &links); err != nil {
++		t.Fatal(err)
++	}
++	if len(links) != 1 || links[0]["type"] != "local" || links[0]["uri"] != want {
++		t.Fatalf("links = %s, want one local link %q", raw, want)
++	}
++}
++
++func TestDedicatedSurgeSnellAutoResetReenablesListenerOwner(t *testing.T) {
++	db := clientTestDB(t)
++	inbound := createDedicatedSnellInbound(t, db, "SurgeSnell-Reset")
++	client := createClient(t, db, &model.Client{
++		Name:      "Reset",
++		Enable:    false,
++		AutoReset: true,
++		ResetDays: 30,
++		NextReset: 999,
++		Up:        400,
++		Down:      600,
++	})
++	bindClientToInbound(t, db, client, inbound.Id)
++
++	ids, err := (&ClientService{}).ResetClients(db, 1_000)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if len(ids) != 1 || ids[0] != inbound.Id {
++		t.Fatalf("changed inbound ids = %v, want [%d]", ids, inbound.Id)
++	}
++	got := reload(t, db, client.Id)
++	if !got.Enable || got.Up != 0 || got.Down != 0 {
++		t.Fatalf("reset client = enable:%v up:%d down:%d", got.Enable, got.Up, got.Down)
++	}
++}
++
++func TestAppendDedicatedSurgeSnellUserStats(t *testing.T) {
++	db := clientTestDB(t)
++	inbound := createDedicatedSnellInbound(t, db, "SurgeSnell-Alice")
++	client := createClient(t, db, &model.Client{Name: "Alice", Enable: true})
++	bindClientToInbound(t, db, client, inbound.Id)
++
++	raw := []model.Stats{
++		{Id: 99, Resource: "inbound", Tag: inbound.Tag, Direction: true, Traffic: 100},
++		{Resource: "inbound", Tag: inbound.Tag, Direction: false, Traffic: 200},
++		{Resource: "inbound", Tag: "ordinary", Direction: false, Traffic: 300},
++		{Resource: "user", Tag: "existing", Direction: false, Traffic: 400},
++	}
++	got, err := appendDedicatedSurgeSnellUserStats(db, raw)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if len(got) != len(raw)+2 {
++		t.Fatalf("got %d rows, want %d: %#v", len(got), len(raw)+2, got)
++	}
++	if len(raw) != 4 || raw[0].Resource != "inbound" || raw[0].Tag != inbound.Tag {
++		t.Fatalf("raw counters were mutated: %#v", raw)
++	}
++
++	for i, wantTraffic := range []int64{100, 200} {
++		stat := got[len(raw)+i]
++		if stat.Id != 0 || stat.Resource != "user" || stat.Tag != "Alice" || stat.Traffic != wantTraffic {
++			t.Errorf("synthetic row %d = %#v", i, stat)
++		}
++	}
++}
++
++func TestAppendDedicatedSurgeSnellUserStatsRejectsAmbiguousBinding(t *testing.T) {
++	db := clientTestDB(t)
++	inbound := createDedicatedSnellInbound(t, db, "SurgeSnell-Shared")
++	bound, _ := json.Marshal([]uint{inbound.Id})
++	createClient(t, db, &model.Client{Name: "Alice", Enable: true, Inbounds: bound})
++	createClient(t, db, &model.Client{Name: "Bob", Enable: true, Inbounds: bound})
++
++	_, err := appendDedicatedSurgeSnellUserStats(db, []model.Stats{{
++		Resource: "inbound",
++		Tag:      inbound.Tag,
++		Traffic:  1,
++	}})
++	if err == nil {
++		t.Fatal("ambiguous binding should be rejected")
++	}
++}
++
++func TestDedicatedSurgeSnellStatMarkerIsCaseSensitive(t *testing.T) {
++	db := clientTestDB(t)
++	inbound := createDedicatedSnellInbound(t, db, "surgesnell-lowercase")
++	client := createClient(t, db, &model.Client{Name: "Alice", Enable: true})
++	bindClientToInbound(t, db, client, inbound.Id)
++
++	got, err := appendDedicatedSurgeSnellUserStats(db, []model.Stats{{
++		Resource: "inbound", Tag: inbound.Tag, Traffic: 1,
++	}})
++	if err != nil {
++		t.Fatal(err)
++	}
++	if len(got) != 1 {
++		t.Fatalf("lowercase marker generated synthetic user stats: %s", fmt.Sprint(got))
++	}
++}
+diff --git a/service/inbounds.go b/service/inbounds.go
+index cb38b35..4305807 100644
+--- a/service/inbounds.go
++++ b/service/inbounds.go
+@@ -5,6 +5,7 @@ import (
+ 	"fmt"
+ 	"os"
+ 	"strings"
++	"time"
+ 
+ 	"github.com/alireza0/s-ui/database"
+ 	"github.com/alireza0/s-ui/database/model"
+@@ -124,6 +125,17 @@ func (s *InboundService) Save(tx *gorm.DB, act string, data json.RawMessage, ini
+ 				return err
+ 			}
+ 		}
++		dedicated := util.IsSurgeSnellInbound(inbound.Type, inbound.Tag)
++		if dedicated {
++			if act == "new" {
++				err = s.validateNewDedicatedSurgeSnellOwner(tx, initUserIds)
++			} else {
++				err = s.validateExistingDedicatedSurgeSnellOwner(tx, inbound.Id)
++			}
++			if err != nil {
++				return err
++			}
++		}
+ 
+ 		if corePtr.IsRunning() {
+ 			if act == "edit" {
+@@ -138,18 +150,22 @@ func (s *InboundService) Save(tx *gorm.DB, act string, data json.RawMessage, ini
+ 				return err
+ 			}
+ 
+-			if act == "edit" {
+-				inboundConfig, err = s.addUsers(tx, inboundConfig, inbound.Id, inbound.Type)
+-			} else {
+-				inboundConfig, err = s.initUsers(tx, inboundConfig, initUserIds, inbound.Type)
+-			}
+-			if err != nil {
+-				return err
+-			}
++			// A dedicated listener is added only after its ownership relation is
++			// saved below. It is never exposed without an accountable Client.
++			if !dedicated {
++				if act == "edit" {
++					inboundConfig, err = s.addUsers(tx, inboundConfig, inbound.Id, inbound.Type)
++				} else {
++					inboundConfig, err = s.initUsers(tx, inboundConfig, initUserIds, inbound.Type)
++				}
++				if err != nil {
++					return err
++				}
+ 
+-			err = corePtr.AddInbound(inboundConfig)
+-			if err != nil {
+-				return err
++				err = corePtr.AddInbound(inboundConfig)
++				if err != nil {
++					return err
++				}
+ 			}
+ 		}
+ 
+@@ -171,6 +187,11 @@ func (s *InboundService) Save(tx *gorm.DB, act string, data json.RawMessage, ini
+ 		if err != nil {
+ 			return err
+ 		}
++		if dedicated && corePtr.IsRunning() {
++			if err = s.UpdateInboundsUsers(tx, []uint{inbound.Id}); err != nil {
++				return err
++			}
++		}
+ 	case "del":
+ 		var tag string
+ 		err = json.Unmarshal(data, &tag)
+@@ -234,6 +255,19 @@ func (s *InboundService) GetAllConfig(db *gorm.DB) ([]json.RawMessage, error) {
+ 		if err != nil {
+ 			return nil, err
+ 		}
++		if util.IsSurgeSnellInbound(inbound.Type, inbound.Tag) {
++			client, err := s.dedicatedSurgeSnellBinding(db, inbound.Id)
++			if err != nil {
++				return nil, err
++			}
++			if !client.active(time.Now().Unix()) {
++				continue
++			}
++			// Keep the runtime config PSK-only. The Client relation controls
++			// accounting and listener lifecycle, not Snell authentication.
++			inboundsJson = append(inboundsJson, inboundJson)
++			continue
++		}
+ 		inboundJson, err = s.addUsers(db, inboundJson, inbound.Id, inbound.Type)
+ 		if err != nil {
+ 			return nil, err
+@@ -292,6 +326,9 @@ func (s *InboundService) fetchUsers(db *gorm.DB, inboundType string, condition s
+ }
+ 
+ func (s *InboundService) addUsers(db *gorm.DB, inboundJson []byte, inboundId uint, inboundType string) ([]byte, error) {
++	if isDedicatedSurgeSnellJSON(inboundType, inboundJson) {
++		return inboundJson, nil
++	}
+ 	if !s.hasUser(inboundType) {
+ 		return inboundJson, nil
+ 	}
+@@ -312,6 +349,12 @@ func (s *InboundService) addUsers(db *gorm.DB, inboundJson []byte, inboundId uin
+ }
+ 
+ func (s *InboundService) initUsers(db *gorm.DB, inboundJson []byte, clientIds string, inboundType string) ([]byte, error) {
++	if isDedicatedSurgeSnellJSON(inboundType, inboundJson) {
++		if _, err := parseDedicatedSurgeSnellClientIDs(clientIds, true); err != nil {
++			return nil, err
++		}
++		return inboundJson, nil
++	}
+ 	ClientIds := strings.Split(clientIds, ",")
+ 	if len(ClientIds) == 0 {
+ 		return inboundJson, nil
+@@ -365,6 +408,34 @@ func (s *InboundService) UpdateInboundsUsers(tx *gorm.DB, ids []uint) error {
+ 		return err
+ 	}
+ 	for _, inbound := range inbounds {
++		if util.IsSurgeSnellInbound(inbound.Type, inbound.Tag) {
++			client, err := s.dedicatedSurgeSnellBinding(tx, inbound.Id)
++			if err != nil {
++				return err
++			}
++
++			err = corePtr.RemoveInbound(inbound.Tag)
++			if err != nil && err != os.ErrInvalid {
++				return err
++			}
++			box.SessionTracker().CloseByInbound(inbound.Tag)
++
++			if !client.active(time.Now().Unix()) {
++				logger.Debug("dedicated Surge Snell inbound ", inbound.Tag, " is stopped: no active client")
++				continue
++			}
++
++			inboundConfig, err := inbound.MarshalJSON()
++			if err != nil {
++				return err
++			}
++			if err = corePtr.AddInbound(inboundConfig); err != nil {
++				return err
++			}
++			logger.Debug("dedicated Surge Snell inbound ", inbound.Tag, " started for client ", client.Name)
++			continue
++		}
++
+ 		inboundConfig, err := inbound.MarshalJSON()
+ 		if err != nil {
+ 			return err
+diff --git a/service/stats.go b/service/stats.go
+index cd0ccb4..026041e 100644
+--- a/service/stats.go
++++ b/service/stats.go
+@@ -8,6 +8,7 @@ import (
+ 	"github.com/alireza0/s-ui/core"
+ 	"github.com/alireza0/s-ui/database"
+ 	"github.com/alireza0/s-ui/database/model"
++	"github.com/alireza0/s-ui/util"
+ 	"github.com/alireza0/s-ui/util/common"
+ 
+ 	"gorm.io/gorm"
+@@ -35,6 +36,70 @@ var (
+ type StatsService struct {
+ }
+ 
++type dedicatedSurgeSnellStatBinding struct {
++	ID   uint   `gorm:"column:id"`
++	Tag  string `gorm:"column:tag"`
++	Name string `gorm:"column:name"`
++}
++
++// dedicatedSurgeSnellStatBindings maps each dedicated listener to its sole
++// Client. The existing JSON relation keeps this change schema-free and makes a
++// rollback possible with the stock binary and unchanged database.
++func dedicatedSurgeSnellStatBindings(db *gorm.DB) (map[string]string, error) {
++	var rows []dedicatedSurgeSnellStatBinding
++	err := db.Raw(
++		`SELECT DISTINCT clients.id AS id, inbounds.tag AS tag, clients.name AS name
++		 FROM clients, json_each(clients.inbounds) AS je, inbounds
++		 WHERE inbounds.id = CAST(je.value AS INTEGER)
++		   AND inbounds.type = 'snell'
++		   AND substr(inbounds.tag, 1, ?) = ?`,
++		len(util.SurgeSnellTagPrefix), util.SurgeSnellTagPrefix,
++	).Scan(&rows).Error
++	if err != nil {
++		return nil, err
++	}
++
++	seen := make(map[string]dedicatedSurgeSnellStatBinding, len(rows))
++	bindings := make(map[string]string, len(rows))
++	for _, row := range rows {
++		if old, exists := seen[row.Tag]; exists && old.ID != row.ID {
++			return nil, common.NewErrorf(
++				"dedicated Surge Snell inbound %q is assigned to multiple clients (%q, %q)",
++				row.Tag, old.Name, row.Name,
++			)
++		}
++		seen[row.Tag] = row
++		bindings[row.Tag] = row.Name
++	}
++	return bindings, nil
++}
++
++// appendDedicatedSurgeSnellUserStats clones every dedicated inbound counter
++// as a standard user counter. Quota, expiry, online status, charting and reset
++// can then use the existing Client paths unchanged.
++func appendDedicatedSurgeSnellUserStats(db *gorm.DB, raw []model.Stats) ([]model.Stats, error) {
++	bindings, err := dedicatedSurgeSnellStatBindings(db)
++	if err != nil {
++		return nil, err
++	}
++	result := append([]model.Stats(nil), raw...)
++	for _, stat := range raw {
++		if stat.Resource != "inbound" {
++			continue
++		}
++		clientName, ok := bindings[stat.Tag]
++		if !ok {
++			continue
++		}
++		userStat := stat
++		userStat.Id = 0
++		userStat.Resource = "user"
++		userStat.Tag = clientName
++		result = append(result, userStat)
++	}
++	return result, nil
++}
++
+ func (s *StatsService) SaveStats(enableTraffic bool, bucketSeconds int64) error {
+ 	if corePtr == nil || !corePtr.IsRunning() {
+ 		return nil
+@@ -51,12 +116,13 @@ func (s *StatsService) SaveStats(enableTraffic bool, bucketSeconds int64) error
+ 
+ 	statsMu.Lock()
+ 	// Anything a previous cycle could not commit goes in ahead of this one.
+-	batch := append(pendingStats, (*drained)...)
++	rawBatch := append([]model.Stats(nil), pendingStats...)
++	rawBatch = append(rawBatch, (*drained)...)
+ 	pendingStats = nil
+ 	online := &onlines{}
+ 	statsMu.Unlock()
+ 
+-	if len(batch) == 0 {
++	if len(rawBatch) == 0 {
+ 		statsMu.Lock()
+ 		onlineResources = online
+ 		statsMu.Unlock()
+@@ -78,7 +144,9 @@ func (s *StatsService) SaveStats(enableTraffic bool, bucketSeconds int64) error
+ 		if err != nil {
+ 			// Hold the drained traffic for the next cycle rather than dropping
+ 			// it on the floor.
+-			pendingStats = batch
++			// Synthetic user rows are rebuilt from raw counters, otherwise a
++			// retry after SQLITE_BUSY charges the Client twice.
++			pendingStats = rawBatch
+ 		} else {
+ 			onlineResources = online
+ 		}
+@@ -86,6 +154,10 @@ func (s *StatsService) SaveStats(enableTraffic bool, bucketSeconds int64) error
+ 	}()
+ 
+ 	now := time.Now().Unix()
++	batch, err := appendDedicatedSurgeSnellUserStats(tx, rawBatch)
++	if err != nil {
++		return err
++	}
+ 
+ 	// Aggregate per-resource so each active inbound/outbound/user is reported
+ 	// online once (a tag may now appear in both directions), and each user's
+diff --git a/service/surge_snell.go b/service/surge_snell.go
+new file mode 100644
+index 0000000..2904a42
+--- /dev/null
++++ b/service/surge_snell.go
+@@ -0,0 +1,262 @@
++package service
++
++import (
++	"encoding/json"
++	"strconv"
++	"strings"
++
++	"github.com/alireza0/s-ui/database/model"
++	"github.com/alireza0/s-ui/util"
++	"github.com/alireza0/s-ui/util/common"
++
++	"gorm.io/gorm"
++)
++
++// A dedicated Surge Snell listener authenticates with one shared PSK. Surge
++// cannot send sing-box's per-user userkey, so clients.inbounds is ownership and
++// accounting metadata in this mode, never a Snell users array.
++func isDedicatedSurgeSnellJSON(inboundType string, inboundJSON []byte) bool {
++	if inboundType != "snell" {
++		return false
++	}
++	var meta struct {
++		Tag string `json:"tag"`
++	}
++	if err := json.Unmarshal(inboundJSON, &meta); err != nil {
++		return false
++	}
++	return util.IsSurgeSnellInbound(inboundType, meta.Tag)
++}
++
++type dedicatedSurgeSnellClient struct {
++	ID     uint   `gorm:"column:id"`
++	Name   string `gorm:"column:name"`
++	Enable bool   `gorm:"column:enable"`
++	Volume int64  `gorm:"column:volume"`
++	Expiry int64  `gorm:"column:expiry"`
++	Up     int64  `gorm:"column:up"`
++	Down   int64  `gorm:"column:down"`
++}
++
++func (client *dedicatedSurgeSnellClient) active(now int64) bool {
++	if client == nil || !client.Enable {
++		return false
++	}
++	// Match ClientService.DepleteClients exactly. Keeping the listener closed
++	// here also covers the short interval before the minute job persists the
++	// disabled state.
++	if client.Volume > 0 && client.Up+client.Down > client.Volume {
++		return false
++	}
++	return client.Expiry <= 0 || client.Expiry >= now
++}
++
++// dedicatedSurgeSnellBinding resolves the sole Client assigned to a listener.
++// Ambiguous legacy/corrupt data fails closed instead of charging an arbitrary
++// account.
++func (s *InboundService) dedicatedSurgeSnellBinding(db *gorm.DB, inboundID uint) (*dedicatedSurgeSnellClient, error) {
++	var clients []dedicatedSurgeSnellClient
++	err := db.Raw(
++		`SELECT DISTINCT clients.id, clients.name, clients.enable, clients.volume,
++		        clients.expiry, clients.up, clients.down
++		 FROM clients, json_each(clients.inbounds) AS je
++		 WHERE CAST(je.value AS INTEGER) = ?`,
++		inboundID,
++	).Scan(&clients).Error
++	if err != nil {
++		return nil, err
++	}
++	if len(clients) > 1 {
++		return nil, common.NewErrorf(
++			"dedicated Surge Snell inbound %d is assigned to %d clients; only one is allowed",
++			inboundID, len(clients),
++		)
++	}
++	if len(clients) == 0 {
++		return nil, nil
++	}
++	return &clients[0], nil
++}
++
++func parseDedicatedSurgeSnellClientIDs(clientIDs string, requireOne bool) ([]uint, error) {
++	unique := make(map[uint]struct{}, 1)
++	for _, rawID := range strings.Split(clientIDs, ",") {
++		rawID = strings.TrimSpace(rawID)
++		if rawID == "" {
++			continue
++		}
++		parsed, err := strconv.ParseUint(rawID, 10, 64)
++		if err != nil || parsed == 0 || uint64(uint(parsed)) != parsed {
++			return nil, common.NewErrorf("invalid client id %q for dedicated Surge Snell", rawID)
++		}
++		unique[uint(parsed)] = struct{}{}
++	}
++	if len(unique) > 1 {
++		return nil, common.NewError("dedicated Surge Snell can be assigned to only one client")
++	}
++	if requireOne && len(unique) != 1 {
++		return nil, common.NewError("dedicated Surge Snell must be assigned to exactly one client")
++	}
++	ids := make([]uint, 0, len(unique))
++	for id := range unique {
++		ids = append(ids, id)
++	}
++	return ids, nil
++}
++
++func dedicatedSurgeSnellCountForClient(db *gorm.DB, clientID uint, exceptInboundID uint) (int64, error) {
++	var count int64
++	query := db.Raw(
++		`SELECT COUNT(DISTINCT inbounds.id)
++		 FROM clients, json_each(clients.inbounds) AS je, inbounds
++		 WHERE clients.id = ?
++		   AND inbounds.id = CAST(je.value AS INTEGER)
++		   AND inbounds.type = 'snell'
++		   AND substr(inbounds.tag, 1, ?) = ?
++		   AND inbounds.id != ?`,
++		clientID, len(util.SurgeSnellTagPrefix), util.SurgeSnellTagPrefix, exceptInboundID,
++	)
++	if err := query.Scan(&count).Error; err != nil {
++		return 0, err
++	}
++	return count, nil
++}
++
++func (s *InboundService) validateNewDedicatedSurgeSnellOwner(db *gorm.DB, clientIDs string) error {
++	ids, err := parseDedicatedSurgeSnellClientIDs(clientIDs, true)
++	if err != nil {
++		return err
++	}
++	var count int64
++	if err = db.Model(model.Client{}).Where("id = ?", ids[0]).Count(&count).Error; err != nil {
++		return err
++	}
++	if count != 1 {
++		return common.NewErrorf("client %d does not exist", ids[0])
++	}
++	existing, err := dedicatedSurgeSnellCountForClient(db, ids[0], 0)
++	if err != nil {
++		return err
++	}
++	if existing > 0 {
++		return common.NewErrorf("client %d already owns a dedicated Surge Snell inbound", ids[0])
++	}
++	return nil
++}
++
++func (s *InboundService) validateExistingDedicatedSurgeSnellOwner(db *gorm.DB, inboundID uint) error {
++	client, err := s.dedicatedSurgeSnellBinding(db, inboundID)
++	if err != nil {
++		return err
++	}
++	if client == nil {
++		return common.NewErrorf("dedicated Surge Snell inbound %d must be assigned to exactly one client", inboundID)
++	}
++	existing, err := dedicatedSurgeSnellCountForClient(db, client.ID, inboundID)
++	if err != nil {
++		return err
++	}
++	if existing > 0 {
++		return common.NewErrorf("client %q already owns another dedicated Surge Snell inbound", client.Name)
++	}
++	return nil
++}
++
++type surgeSnellClaim struct {
++	clientID uint
++	name     string
++	batchKey int
++}
++
++// validateDedicatedSurgeSnellAssignments enforces both halves of the 1:1
++// relation when Clients are created or edited. Existing clients included in a
++// bulk edit are evaluated by their proposed state, so an atomic reassignment
++// remains possible.
++func (s *ClientService) validateDedicatedSurgeSnellAssignments(db *gorm.DB, clients []*model.Client) error {
++	clientInboundIDs := make([][]uint, len(clients))
++	var allInboundIDs []uint
++	proposedClientIDs := make(map[uint]struct{}, len(clients))
++	for index, client := range clients {
++		if err := json.Unmarshal(client.Inbounds, &clientInboundIDs[index]); err != nil {
++			return err
++		}
++		allInboundIDs = common.UnionUintArray(allInboundIDs, clientInboundIDs[index])
++		if client.Id != 0 {
++			proposedClientIDs[client.Id] = struct{}{}
++		}
++	}
++	if len(allInboundIDs) == 0 {
++		return nil
++	}
++
++	var inbounds []model.Inbound
++	if err := db.Model(model.Inbound{}).Where("id in ?", allInboundIDs).Find(&inbounds).Error; err != nil {
++		return err
++	}
++	dedicatedIDs := make(map[uint]struct{})
++	for _, inbound := range inbounds {
++		if util.IsSurgeSnellInbound(inbound.Type, inbound.Tag) {
++			dedicatedIDs[inbound.Id] = struct{}{}
++		}
++	}
++
++	claims := make(map[uint]surgeSnellClaim, len(dedicatedIDs))
++	for index, inboundIDs := range clientInboundIDs {
++		seenForClient := make(map[uint]struct{}, 1)
++		for _, inboundID := range inboundIDs {
++			if _, dedicated := dedicatedIDs[inboundID]; dedicated {
++				seenForClient[inboundID] = struct{}{}
++			}
++		}
++		if len(seenForClient) > 1 {
++			return common.NewErrorf("client %q can own only one dedicated Surge Snell inbound", clients[index].Name)
++		}
++		for inboundID := range seenForClient {
++			claim := surgeSnellClaim{clientID: clients[index].Id, name: clients[index].Name, batchKey: index}
++			if old, exists := claims[inboundID]; exists && old.batchKey != index {
++				return common.NewErrorf(
++					"dedicated Surge Snell inbound %d cannot be shared by clients %q and %q",
++					inboundID, old.name, claim.name,
++				)
++			}
++			claims[inboundID] = claim
++		}
++	}
++	if len(claims) == 0 {
++		return nil
++	}
++
++	selectedIDs := make([]uint, 0, len(claims))
++	for inboundID := range claims {
++		selectedIDs = append(selectedIDs, inboundID)
++	}
++	type persistedOwner struct {
++		InboundID uint   `gorm:"column:inbound_id"`
++		ClientID  uint   `gorm:"column:client_id"`
++		Name      string `gorm:"column:name"`
++	}
++	var owners []persistedOwner
++	if err := db.Raw(
++		`SELECT DISTINCT CAST(je.value AS INTEGER) AS inbound_id,
++		        clients.id AS client_id, clients.name AS name
++		 FROM clients, json_each(clients.inbounds) AS je
++		 WHERE CAST(je.value AS INTEGER) IN ?`,
++		selectedIDs,
++	).Scan(&owners).Error; err != nil {
++		return err
++	}
++	for _, owner := range owners {
++		claim := claims[owner.InboundID]
++		if claim.clientID != 0 && claim.clientID == owner.ClientID {
++			continue
++		}
++		if _, beingEdited := proposedClientIDs[owner.ClientID]; beingEdited {
++			continue
++		}
++		return common.NewErrorf(
++			"dedicated Surge Snell inbound %d is already owned by client %q",
++			owner.InboundID, owner.Name,
++		)
++	}
++	return nil
++}
+diff --git a/util/genLink.go b/util/genLink.go
+index eb65556..3fae258 100644
+--- a/util/genLink.go
++++ b/util/genLink.go
+@@ -12,7 +12,7 @@ import (
+ 	"github.com/alireza0/s-ui/util/common"
+ )
+ 
+-var InboundTypeWithLink = []string{"socks", "http", "mixed", "shadowsocks", "naive", "hysteria", "hysteria2", "anytls", "tuic", "vless", "trojan", "vmess"}
++var InboundTypeWithLink = []string{"socks", "http", "mixed", "shadowsocks", "naive", "hysteria", "hysteria2", "anytls", "tuic", "vless", "trojan", "vmess", "snell"}
+ 
+ type LinkParam struct {
+ 	Key   string
+@@ -112,11 +112,91 @@ func LinkGenerator(clientConfig json.RawMessage, i *model.Inbound, hostname stri
+ 		return trojanLink(userConfig["trojan"], *inbound, Addrs)
+ 	case "vmess":
+ 		return vmessLink(userConfig["vmess"], *inbound, Addrs)
++	case "snell":
++		if IsSurgeSnellInbound(i.Type, i.Tag) {
++			return surgeSnellLink(*inbound, Addrs)
++		}
+ 	}
+ 
+ 	return []string{}
+ }
+ 
++// surgeSnellLink renders complete entries for Surge's [Proxy] section rather
++// than a URI: Surge does not define a snell:// sharing scheme. The version is
++// read from the inbound (the actual server protocol version), not out_json;
++// sing-box calls the client side of a v5 server "version 4", while Surge calls
++// both sides version 5.
++func surgeSnellLink(inbound map[string]interface{}, addrs []map[string]interface{}) []string {
++	rawPSK := stringOr(inbound["psk"], "")
++	psk, pskOK := surgeConfigValue(rawPSK)
++	versionValue, ok := inbound["version"].(float64)
++	version := int(versionValue)
++	if rawPSK == "" || !pskOK || !ok || version < 1 || version > 6 {
++		return nil
++	}
++
++	params := []string{
++		"psk=" + psk,
++		fmt.Sprintf("version=%d", version),
++	}
++	if version >= 4 {
++		params = append(params, "reuse=true")
++	}
++
++	obfsMode := stringOr(inbound["obfs_mode"], "")
++	if (version <= 3 && (obfsMode == "http" || obfsMode == "tls")) ||
++		((version == 4 || version == 5) && obfsMode == "http") {
++		params = append(params, "obfs="+obfsMode)
++	}
++	if version == 6 {
++		if mode := stringOr(inbound["mode"], ""); mode != "" {
++			params = append(params, "mode="+mode)
++		}
++	}
++
++	var links []string
++	for _, addr := range addrs {
++		host := stringOr(addr["server"], "")
++		port, portOK := addr["server_port"].(float64)
++		// A host cannot legitimately contain profile delimiters. Reject CR/LF
++		// as well so an address override cannot inject another policy line.
++		if host == "" || strings.ContainsAny(host, ",\r\n") || !portOK || port < 1 || port > 65535 {
++			continue
++		}
++		name := surgePolicyName(stringOr(addr["remark"], "SurgeSnell"))
++		links = append(links, fmt.Sprintf(
++			"%s = snell, %s, %.0f, %s",
++			name, host, port, strings.Join(params, ", "),
++		))
++	}
++	return links
++}
++
++// Surge's profile grammar allows comma-containing values when quoted. Control
++// characters are refused because a generated Link must always remain one
++// policy line.
++func surgeConfigValue(value string) (string, bool) {
++	if strings.ContainsAny(value, "\r\n") {
++		return "", false
++	}
++	if strings.ContainsAny(value, ",;#\"'\t ") {
++		escaped := strings.NewReplacer(`\`, `\\`, `"`, `\"`).Replace(value)
++		return `"` + escaped + `"`, true
++	}
++	return value, true
++}
++
++// Surge uses comma and '=' as policy delimiters. They are harmless in a
++// display remark but would split a generated policy name into new fields.
++func surgePolicyName(name string) string {
++	name = strings.NewReplacer("\r", " ", "\n", " ", ",", "-", "=", "-").Replace(name)
++	name = strings.TrimSpace(name)
++	if name == "" {
++		return "SurgeSnell"
++	}
++	return name
++}
++
+ func prepareTls(t *model.Tls) map[string]interface{} {
+ 	var iTls, oTls map[string]interface{}
+ 	if err := json.Unmarshal(t.Client, &oTls); err != nil {
+diff --git a/util/genlink_test.go b/util/genlink_test.go
+index f71ecae..ef096b3 100644
+--- a/util/genlink_test.go
++++ b/util/genlink_test.go
+@@ -236,3 +236,83 @@ func TestVmessGrpcCarriesTheServiceName(t *testing.T) {
+ 		t.Errorf("path = %v, want MyService -- the grpc service name was dropped", obj["path"])
+ 	}
+ }
++
++func TestDedicatedSurgeSnellLinkUsesServerVersion(t *testing.T) {
++	inbound := inboundFor(t, "snell", map[string]interface{}{
++		"version":   5,
++		"psk":       "the-pre-shared-key",
++		"obfs_mode": "http",
++	})
++	inbound.Tag = "SurgeSnell-Alice"
++
++	links := LinkGenerator(json.RawMessage(`{}`), inbound, "snell.example.com", "VIP")
++	if len(links) != 1 {
++		t.Fatalf("got %d links, want 1: %v", len(links), links)
++	}
++	want := "VIP-SurgeSnell-Alice = snell, snell.example.com, 443, psk=the-pre-shared-key, version=5, reuse=true, obfs=http"
++	if links[0] != want {
++		t.Fatalf("link = %q, want %q", links[0], want)
++	}
++}
++
++func TestDedicatedSurgeSnellLinkTracksAddressAndV6Mode(t *testing.T) {
++	inbound := inboundFor(t, "snell", map[string]interface{}{
++		"version": 6,
++		"psk":     "new-key",
++		"mode":    "unshaped",
++	})
++	inbound.Tag = "SurgeSnell-Bob"
++	inbound.Addrs = json.RawMessage(`[{"server":"2001:db8::1","server_port":52728,"remark":"-HK"}]`)
++
++	links := LinkGenerator(json.RawMessage(`{}`), inbound, "ignored.example.com", "")
++	want := "SurgeSnell-Bob-HK = snell, 2001:db8::1, 52728, psk=new-key, version=6, reuse=true, mode=unshaped"
++	if len(links) != 1 || links[0] != want {
++		t.Fatalf("links = %v, want [%q]", links, want)
++	}
++}
++
++func TestOrdinarySnellDoesNotGenerateSurgePolicy(t *testing.T) {
++	inbound := inboundFor(t, "snell", map[string]interface{}{
++		"version": 5,
++		"psk":     "shared-key",
++	})
++
++	if links := LinkGenerator(json.RawMessage(`{}`), inbound, "example.com", ""); len(links) != 0 {
++		t.Fatalf("ordinary Snell generated Surge links: %v", links)
++	}
++}
++
++func TestDedicatedSurgeSnellQuotesCommaInPSK(t *testing.T) {
++	inbound := inboundFor(t, "snell", map[string]interface{}{
++		"version": 5,
++		"psk":     "key,with,commas",
++	})
++	inbound.Tag = "SurgeSnell-Quoted"
++
++	links := LinkGenerator(json.RawMessage(`{}`), inbound, "example.com", "")
++	want := `SurgeSnell-Quoted = snell, example.com, 443, psk="key,with,commas", version=5, reuse=true`
++	if len(links) != 1 || links[0] != want {
++		t.Fatalf("links = %v, want [%q]", links, want)
++	}
++}
++
++func TestDedicatedSurgeSnellRejectsMultilineFields(t *testing.T) {
++	for name, tc := range map[string]struct {
++		host string
++		psk  string
++	}{
++		"host": {host: "safe.example\nInjected = direct", psk: "safe"},
++		"psk":  {host: "safe.example", psk: "safe\nInjected = direct"},
++	} {
++		t.Run(name, func(t *testing.T) {
++			inbound := inboundFor(t, "snell", map[string]interface{}{
++				"version": 5,
++				"psk":     tc.psk,
++			})
++			inbound.Tag = "SurgeSnell-Safe"
++			if links := LinkGenerator(json.RawMessage(`{}`), inbound, tc.host, ""); len(links) != 0 {
++				t.Fatalf("unsafe field generated links: %v", links)
++			}
++		})
++	}
++}
+diff --git a/util/surgeSnell.go b/util/surgeSnell.go
+new file mode 100644
+index 0000000..4bc0053
+--- /dev/null
++++ b/util/surgeSnell.go
+@@ -0,0 +1,12 @@
++package util
++
++import "strings"
++
++// SurgeSnellTagPrefix marks a Snell inbound as a dedicated, single-client
++// listener whose PSK is consumed directly by Surge. Ordinary Snell inbounds
++// keep their existing sing-box multi-user behaviour.
++const SurgeSnellTagPrefix = "SurgeSnell-"
++
++func IsSurgeSnellInbound(inboundType, tag string) bool {
++	return inboundType == "snell" && strings.HasPrefix(tag, SurgeSnellTagPrefix)
++}
